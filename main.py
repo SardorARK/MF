@@ -1,213 +1,222 @@
+"""
+Бот-зазывала для Telegram (aiogram 3.x).
+
+Команда /r в группе тегает всех известных боту участников и созывает их.
+Можно добавить свой текст:  /r Го играть в мафию!
+
+Запуск:
+    pip install aiogram
+    вставьте токен в строку BOT_TOKEN ниже
+    python main.py
+"""
+
 import asyncio
+import html
+import json
 import logging
-import random
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-Bot tokenini shu yerga kiriting
-BOT_TOKEN = "9116459506:AAEmgu1GDMiJ-gyaSCIvgPftEK1j1PhukCg"
+import os
+import time
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatType, ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.filters import Command, CommandObject
+from aiogram.filters.chat_member_updated import (
+    JOIN_TRANSITION,
+    LEAVE_TRANSITION,
+    ChatMemberUpdatedFilter,
+)
+from aiogram.types import ChatMemberUpdated, Message, User
+
+# ---------------------------- НАСТРОЙКИ ----------------------------
+BOT_TOKEN = "9165282045:AAG2N3oOoV4rwjXX6x_iQrtbV3483XYOrm8"  # замените текст в кавычках на свой токен
+DATA_FILE = Path(__file__).with_name("members.json")  # тут хранятся участники
+BATCH_SIZE = 5          # сколько людей тегать в одном сообщении
+BATCH_DELAY = 1.1       # пауза между сообщениями (лимит Telegram ~1 сообщение/сек в чат)
+COOLDOWN = 30           # секунд между вызовами /r в одной группе
+MAX_NAME_LEN = 32       # максимальная длина имени в упоминании
+# --------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-O'yin ma'lumotlarini vaqtinchalik xotirada saqlash (chat_id bo'yicha)
-games = {}
-Rollarni taqsimlash funksiyasi
-def assign_roles(players_list):
-count = len(players_list)
-roles = []
-# O'yinchilar soniga qarab rollar
-mafia_count = max(1, count // 3)
-roles.extend(["Mafia"] * mafia_count)
-if count >= 4:
-roles.append("Komissar")
-if count >= 5:
-roles.append("Doktor")
-# Qolganlari Tinch aholi
-while len(roles) < count:
-    roles.append("Tinch aholi")
-    
-random.shuffle(roles)
-return dict(zip(players_list, roles))
-1. O'yinni e'lon qilish (/game)
-@dp.message(Command("game"))
-async def start_registration(message: types.Message):
-if message.chat.type == "private":
-await message.answer("Bu buyruq faqat guruhlarda ishlaydi!")
-return
-chat_id = message.chat.id
-if chat_id in games and games[chat_id]["status"] != "ended":
-    await message.answer("Bu guruhda allaqachon o'yin ketmoqda!")
-    return
+log = logging.getLogger("zazyvala")
 
-games[chat_id] = {
-    "status": "registration",
-    "players": {},      # {user_id: full_name}
-    "roles": {},        # {user_id: role}
-    "alive": [],        # [user_id, ...]
-    "night_actions": {}, # {"mafia": target_id, "doctor": target_id, "sheriff": target_id}
-    "votes": {}         # {voter_id: target_id}
-}
+router = Router()
+GROUPS = {ChatType.GROUP, ChatType.SUPERGROUP}
 
-kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="➕ O'yinga qo'shilish", callback_data="join_game")]
-])
-await message.answer(
-    "🎲 **Mafia o'yini uchun ro'yxatdan o'tish boshlandi!**\n\n"
-    "O'yinga qo'shilish uchun tugmani bosing (kamida 4 kishi kerak).\n"
-    "Boshlash uchun /start_mafia buyrug'ini yozing.",
-    reply_markup=kb,
-    parse_mode="Markdown"
-)
-O'yinga qo'shilish tugmasi bosilganda
-@dp.callback_query(F.data == "join_game")
-async def join_game_callback(callback: CallbackQuery):
-chat_id = callback.message.chat.id
-user = callback.from_user
-if chat_id not in games or games[chat_id]["status"] != "registration":
-    await callback.answer("Ro'yxatdan o'tish yopilgan!", show_alert=True)
-    return
 
-if user.id in games[chat_id]["players"]:
-    await callback.answer("Siz allaqachon ro'yxatdasiz!", show_alert=True)
-    return
+class MemberStore:
+    """Хранилище участников групп: {chat_id: {user_id: имя}} в JSON-файле."""
 
-# Bot lichkasiga yozish imkoniyatini tekshirish
-try:
-    await bot.send_message(user.id, "✅ Siz guruhdagi Mafia o'yiniga qo'shildingiz! O'yin boshlanishini kuting.")
-except Exception:
-    await callback.answer("Avval botga kirib /start bosing (lichkaga yozish uchun)!", show_alert=True)
-    return
+    def __init__(self, path: Path):
+        self.path = path
+        self.data: dict[str, dict[str, str]] = {}
+        self._lock = asyncio.Lock()
 
-games[chat_id]["players"][user.id] = user.full_name
-players_names = "\n".join([f"• {name}" for name in games[chat_id]["players"].values()])
+    def load(self) -> None:
+        if self.path.exists():
+            try:
+                self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                log.exception("Не удалось прочитать %s, начинаем с пустого", self.path)
+                self.data = {}
 
-kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="➕ O'yinga qo'shilish", callback_data="join_game")]
-])
-await callback.message.edit_text(
-    f"🎲 **Mafia o'yini uchun ro'yxatdan o'tish boshlandi!**\n\n"
-    f"**Ro'yxatdagilar ({len(games[chat_id]['players'])}):**\n{players_names}\n\n"
-    f"O'yinni boshlash uchun: /start_mafia",
-    reply_markup=kb,
-    parse_mode="Markdown"
-)
-await callback.answer("Qo'shildingiz!")
-2. O'yinni boshlash (/start_mafia)
-@dp.message(Command("start_mafia"))
-async def begin_game(message: types.Message):
-chat_id = message.chat.id
-if chat_id not in games or games[chat_id]["status"] != "registration":
-return
-players = list(games[chat_id]["players"].keys())
-if len(players) < 4:
-    await message.answer("❌ O'yinni boshlash uchun kamida 4 nafar o'yinchi kerak!")
-    return
+    def _write(self) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.path)  # атомарная замена, файл не повредится при сбое
 
-games[chat_id]["alive"] = players.copy()
-roles = assign_roles(players)
-games[chat_id]["roles"] = roles
+    async def save(self) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._write)
 
-# Har bir o'yinchiga rolini shaxsiy xabarda yuborish
-for uid, role in roles.items():
-    await bot.send_message(uid, f"🎭 O'yin boshlandi! Sizning rolingiz: **{role}**", parse_mode="Markdown")
+    async def add(self, chat_id: int, user: User) -> None:
+        if user.is_bot:
+            return
+        chat = self.data.setdefault(str(chat_id), {})
+        name = user.full_name[:MAX_NAME_LEN] or "Участник"
+        if chat.get(str(user.id)) != name:
+            chat[str(user.id)] = name
+            await self.save()
 
-await message.answer("🌃 **O'yin boshlandi! Shaharga tun cho'kdi...**\n"
-                     "Tinch aholi uxlamoqda. Aktiv rollar bot lichkasida o'z tanlovini qilmoqda.", parse_mode="Markdown")
-await night_phase(chat_id)
-3. Tun fazasi
-async def night_phase(chat_id):
-game = games[chat_id]
-game["status"] = "night"
-game["night_actions"] = {}
-alive_players = game["alive"]
+    async def remove(self, chat_id: int, user_id: int) -> None:
+        chat = self.data.get(str(chat_id), {})
+        if chat.pop(str(user_id), None) is not None:
+            await self.save()
 
-# Aktiv rollarga tanlov tugmalarini yuborish
-for uid in alive_players:
-    role = game["roles"][uid]
-    if role in ["Mafia", "Komissar", "Doktor"]:
-        buttons = []
-        for target_id in alive_players:
-            if role != "Doktor" and target_id == uid:
-                continue # Mafia va Komissar o'zini tanlay olmaydi
-            target_name = game["players"][target_id]
-            buttons.append([InlineKeyboardButton(
-                text=target_name, 
-                callback_data=f"night_{chat_id}_{role}_{target_id}"
-            )])
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await bot.send_message(uid, f"🌙 Tun. **{role}**, kimni tanlaysiz?", reply_markup=kb, parse_mode="Markdown")
+    def members(self, chat_id: int) -> dict[int, str]:
+        return {int(uid): name for uid, name in self.data.get(str(chat_id), {}).items()}
 
-# Tungi harakatlar uchun 25 soniya kutish
-await asyncio.sleep(25)
-await resolve_night(chat_id)
-Tungi tanlovlarni qabul qilish
-@dp.callback_query(F.data.startswith("night_"))
-async def handle_night_action(callback: CallbackQuery):
-, chat_id_str, role, target_id_str = callback.data.split("")
-chat_id = int(chat_id_str)
-target_id = int(target_id_str)
-if chat_id not in games or games[chat_id]["status"] != "night":
-    await callback.answer("Tun tugagan!", show_alert=True)
-    return
 
-games[chat_id]["night_actions"][role] = target_id
-target_name = games[chat_id]["players"][target_id]
+store = MemberStore(DATA_FILE)
+last_call: dict[int, float] = {}   # chat_id -> время последнего /r
+running: set[int] = set()          # чаты, где /r выполняется прямо сейчас
 
-if role == "Komissar":
-    target_role = games[chat_id]["roles"][target_id]
-    is_mafia = "HA, u Mafia! 🔫" if target_role == "Mafia" else "Yo'q, u tinch aholi."
-    await callback.message.edit_text(f"🔍 Tekshiruv natijasi ({target_name}): **{is_mafia}**", parse_mode="Markdown")
-else:
-    await callback.message.edit_text(f"✅ Siz **{target_name}** ni tanladingiz.", parse_mode="Markdown")
-await callback.answer()
-4. Tun natijalarini hisoblash va Kun fazasiga o'tish
-async def resolve_night(chat_id):
-game = games[chat_id]
-actions = game["night_actions"]
-mafia_target = actions.get("Mafia")
-doctor_target = actions.get("Doktor")
 
-report = "☀️ **Tong otdi!**\n\n"
-if mafia_target:
-    if mafia_target == doctor_target:
-        report += "💉 Mafia hujum qildi, lekin **Doktor** o'z vaqtida yetib kelib qurbonni qutqarib qoldi! Hech kim o'lmadi."
-    else:
-        victim_name = game["players"][mafia_target]
-        victim_role = game["roles"][mafia_target]
-        game["alive"].remove(mafia_target)
-        report += f"💀 Tunda **{victim_name}** ({victim_role}) shafqatsizlarcha o'ldirildi."
-else:
-    report += "😴 Tun tinch o'tdi, hech kim o'lmadi."
+def mention(user_id: int, name: str) -> str:
+    return f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
 
-await bot.send_message(chat_id, report, parse_mode="Markdown")
 
-if await check_winner(chat_id):
-    return
+async def safe_send(bot: Bot, chat_id: int, text: str) -> None:
+    """Отправка с повтором при лимите Telegram (429)."""
+    for _ in range(3):
+        try:
+            await bot.send_message(chat_id, text)
+            return
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramBadRequest:
+            log.exception("Не удалось отправить сообщение в чат %s", chat_id)
+            return
 
-await day_phase(chat_id)
-5. Kun fazasi (Muhokama va Ovoz berish)
-async def day_phase(chat_id):
-game = games[chat_id]
-game["status"] = "day"
-game["votes"] = {}
-await bot.send_message(chat_id, "🗣 **Muhokama vaqti!** Mafia kim ekanligini aniqlang (20 soniya muhokama).")
-await asyncio.sleep(20)
 
-# Ovoz berish tugmalarini chiqarish
-buttons = []
-for uid in game["alive"]:
-    buttons.append([InlineKeyboardButton(
-        text=f"Osish: {game['players'][uid]}", 
-        callback_data=f"vote_{chat_id}_{uid}"
-    )])
-kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-await bot.send_message(chat_id, "⚖️ **Ovoz berish boshlandi!** Kimni o'yindan chetlatamiz? (15 soniya)", reply_markup=kb, parse_mode="Markdown")
+# ----------------------------- КОМАНДЫ -----------------------------
+@router.message(Command("start", "help"), F.chat.type == ChatType.PRIVATE)
+async def cmd_start(message: Message) -> None:
+    await message.answer(
+        "👋 Я бот-зазывала.\n\n"
+        "Добавьте меня в группу и дайте права администратора, "
+        "затем пишите <b>/r</b> — я отмечу всех участников.\n"
+        "Свой текст: <code>/r Го играть!</code>"
+    )
 
-await asyncio.sleep(15)
-await resolve_day(chat_id)
-@dp.callback_query(F.data.startswith("vote_"))
-async def handle_vote(callback: CallbackQuery):
-, chat_id_str, target_id_str = callback.data.split("")
-chat_id = int(chat_id_str)
-target_id = int(target_id_str)
-voter_id = callback.from_user.id
+
+@router.message(Command("r"), F.chat.type == ChatType.PRIVATE)
+async def cmd_r_private(message: Message) -> None:
+    await message.answer("Эта команда работает только в группах!")
+
+
+@router.message(Command("r"), F.chat.type.in_(GROUPS))
+async def cmd_call(message: Message, command: CommandObject, bot: Bot) -> None:
+    chat_id = message.chat.id
+    caller = message.from_user
+
+    if chat_id in running:
+        return
+    wait = COOLDOWN - (time.monotonic() - last_call.get(chat_id, -COOLDOWN))
+    if wait > 0:
+        await message.reply(f"⏳ Подождите ещё {int(wait) + 1} сек.")
+        return
+
+    running.add(chat_id)
+    try:
+        last_call[chat_id] = time.monotonic()
+
+        # Запоминаем вызывающего и всех администраторов (их Telegram отдаёт боту)
+        if caller:
+            await store.add(chat_id, caller)
+        try:
+            for admin in await bot.get_chat_administrators(chat_id):
+                await store.add(chat_id, admin.user)
+        except TelegramBadRequest:
+            log.warning("Не удалось получить список админов чата %s", chat_id)
+
+        members = store.members(chat_id)
+        if caller:
+            members.pop(caller.id, None)  # самого вызывающего не тегаем
+
+        if not members:
+            await message.reply(
+                "🤷 Я пока никого не знаю в этой группе. "
+                "Пусть участники напишут хоть одно сообщение, "
+                "и я их запомню (бот должен быть администратором)."
+            )
+            return
+
+        caller_name = html.escape(caller.full_name) if caller else "Кто-то"
+        extra = f"\n\n💬 {html.escape(command.args)}" if command.args else ""
+        await safe_send(
+            bot, chat_id,
+            f"📢 <b>{caller_name} созывает всех!</b>{extra}",
+        )
+
+        items = [mention(uid, name) for uid, name in members.items()]
+        for i in range(0, len(items), BATCH_SIZE):
+            await asyncio.sleep(BATCH_DELAY)
+            await safe_send(bot, chat_id, "🔔 " + " ".join(items[i:i + BATCH_SIZE]))
+    finally:
+        running.discard(chat_id)
+
+
+# ------------------- ЗАПОМИНАНИЕ УЧАСТНИКОВ ГРУППЫ -------------------
+@router.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION), F.chat.type.in_(GROUPS))
+async def on_join(event: ChatMemberUpdated) -> None:
+    await store.add(event.chat.id, event.new_chat_member.user)
+
+
+@router.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION), F.chat.type.in_(GROUPS))
+async def on_leave(event: ChatMemberUpdated) -> None:
+    await store.remove(event.chat.id, event.new_chat_member.user.id)
+
+
+# Этот обработчик должен стоять ПОСЛЕ команд: он ловит все остальные сообщения
+@router.message(F.chat.type.in_(GROUPS))
+async def remember_members(message: Message) -> None:
+    chat_id = message.chat.id
+    if message.from_user:
+        await store.add(chat_id, message.from_user)
+    for user in message.new_chat_members or []:
+        await store.add(chat_id, user)
+    if message.left_chat_member:
+        await store.remove(chat_id, message.left_chat_member.id)
+
+
+# ------------------------------ ЗАПУСК ------------------------------
+async def main() -> None:
+    if not BOT_TOKEN or BOT_TOKEN.startswith("ВСТАВЬТЕ"):
+        raise SystemExit("Вставьте токен бота в строку BOT_TOKEN в начале файла main.py.")
+
+    store.load()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
