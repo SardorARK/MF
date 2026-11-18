@@ -5,7 +5,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 Bot tokenini shu yerga kiriting
-BOT_TOKEN = "SIZNING_BOT_TOKENINGIZ"
+BOT_TOKEN = "9116459506:AAEmgu1GDMiJ-gyaSCIvgPftEK1j1PhukCg"
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
